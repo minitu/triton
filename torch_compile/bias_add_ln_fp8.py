@@ -19,7 +19,7 @@ def bias_add_ln_fp8(
     out2 = torch.nn.functional.layer_norm(out1, w_shape, ln_weight, ln_bias, eps)
 
     # Obtain FP8 amax
-    amax = torch.max(out2).to(torch.float32)
+    amax = torch.max(torch.abs(out2)).to(torch.float32)
 
     # Apply FP8 scale and cast to FP8
     out2 = (out2 * fp8_scale).to(output_dtype)
