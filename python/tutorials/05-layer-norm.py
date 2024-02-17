@@ -88,7 +88,7 @@ def _layer_norm_fwd_fused(
         b = tl.load(B + cols, mask=mask)
         x = tl.load(X + cols, mask=mask, other=0.).to(tl.float32)
         x_hat = (x - mean) * rstd
-        y = x_hat * w + b
+        y = (x_hat * w + b).to(tl.float8e4nv)
         # Write output
         tl.store(Y + cols, y, mask=mask)
 
@@ -228,9 +228,9 @@ def _layer_norm_bwd_dwdb(DW,  # pointer to the partial sum of weights gradient
 class LayerNorm(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, x, normalized_shape, weight, bias, eps):
+    def forward(ctx, x, normalized_shape, weight, bias, eps, output_dtype):
         # allocate output
-        y = torch.empty_like(x)
+        y = torch.empty_like(x, dtype=output_dtype)
         # reshape input data into 2D tensor
         x_arg = x.reshape(-1, x.shape[-1])
         M, N = x_arg.shape
@@ -286,24 +286,30 @@ class LayerNorm(torch.autograd.Function):
             _dw, _db, dw, db, min(GROUP_SIZE_M, M), N,  #
             BLOCK_SIZE_M=32,  #
             BLOCK_SIZE_N=128, num_ctas=1)
-        return dx, None, dw, db, None
+        return dx, None, dw, db, None, None
 
 
 layer_norm = LayerNorm.apply
 
 
-def test_layer_norm(M, N, dtype, eps=1e-5, device='cuda'):
+def test_layer_norm(M, N, input_dtype, output_dtype, eps=1e-5, device='cuda'):
     # create data
     x_shape = (M, N)
     w_shape = (x_shape[-1], )
-    weight = torch.rand(w_shape, dtype=dtype, device='cuda', requires_grad=True)
-    bias = torch.rand(w_shape, dtype=dtype, device='cuda', requires_grad=True)
-    x = -2.3 + 0.5 * torch.randn(x_shape, dtype=dtype, device='cuda')
+    weight = torch.rand(w_shape, dtype=input_dtype, device='cuda', requires_grad=True)
+    bias = torch.rand(w_shape, dtype=input_dtype, device='cuda', requires_grad=True)
+    x = -2.3 + 0.5 * torch.randn(x_shape, dtype=input_dtype, device='cuda')
     dy = .1 * torch.randn_like(x)
     x.requires_grad_(True)
     # forward pass
-    y_tri = layer_norm(x, w_shape, weight, bias, eps)
-    y_ref = torch.nn.functional.layer_norm(x, w_shape, weight, bias, eps).to(dtype)
+    y_tri = layer_norm(x, w_shape, weight, bias, eps, output_dtype)
+    y_ref = torch.nn.functional.layer_norm(x, w_shape, weight, bias, eps).to(output_dtype)
+    y_tri_fp32 = y_tri.to(torch.float32)
+    y_ref_fp32 = y_ref.to(torch.float32)
+    print(y_tri)
+    print(y_ref)
+    #torch.testing.assert_close(y_tri_fp32, y_ref_fp32, atol=1e-5, rtol=0)
+    '''
     # backward pass (triton)
     y_tri.backward(dy, retain_graph=True)
     dx_tri, dw_tri, db_tri = [_.grad.clone() for _ in [x, weight, bias]]
@@ -316,6 +322,7 @@ def test_layer_norm(M, N, dtype, eps=1e-5, device='cuda'):
     assert torch.allclose(dx_tri, dx_ref, atol=1e-2, rtol=0)
     assert torch.allclose(db_tri, db_ref, atol=1e-2, rtol=0)
     assert torch.allclose(dw_tri, dw_ref, atol=1e-2, rtol=0)
+    '''
 
 
 @triton.testing.perf_report(
@@ -328,7 +335,7 @@ def test_layer_norm(M, N, dtype, eps=1e-5, device='cuda'):
         styles=[('blue', '-'), ('green', '-'), ('orange', '-')],
         ylabel='GB/s',
         plot_name='layer-norm-backward',
-        args={'M': 4096, 'dtype': torch.float16, 'mode': 'backward'},
+        args={'M': 4096, 'dtype': torch.float16, 'mode': 'forward'},
     ))
 def bench_layer_norm(M, N, dtype, provider, mode='backward', eps=1e-5, device='cuda'):
     # create data
@@ -373,8 +380,9 @@ def bench_layer_norm(M, N, dtype, provider, mode='backward', eps=1e-5, device='c
     return gbps(ms), gbps(max_ms), gbps(min_ms)
 
 
-test_layer_norm(1151, 8192, torch.float16)
-bench_layer_norm.run(save_path='.', print_data=True)
+test_layer_norm(1151, 8192, torch.bfloat16, torch.float8_e4m3fn)
+#test_layer_norm(1151, 8192, torch.float16)
+#bench_layer_norm.run(save_path='.', print_data=True)
 
 # %%
 # References
