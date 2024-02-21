@@ -11,13 +11,15 @@ def bias_add_ln_fp8_native(
     eps: torch.float32,
     fp8_scale: torch.float32,
     output_dtype: torch.dtype,
+    zero_centered_gamma: bool,
 ) -> torch.Tensor:
     # Bias-Add
     out1 = (x + bias) + residual
     out1 = out1.view(-1, w_shape[-1])
 
     # LayerNorm
-    out2 = torch.nn.functional.layer_norm(out1, w_shape, ln_weight, ln_bias, eps)
+    w = ln_weight if not zero_centered_gamma else 1 + ln_weight
+    out2 = torch.nn.functional.layer_norm(out1, w_shape, w, ln_bias, eps)
 
     # Obtain FP8 amax
     amax = torch.amax(torch.abs(out2)).to(torch.float32)
@@ -38,6 +40,7 @@ def bias_add_ln_fp8_compile(
     eps: torch.float32,
     fp8_scale: torch.float32,
     output_dtype: torch.dtype,
+    zero_centered_gamma: bool,
 ) -> torch.Tensor:
     return bias_add_ln_fp8_native(x,
                                   bias,
@@ -47,7 +50,9 @@ def bias_add_ln_fp8_compile(
                                   ln_bias,
                                   eps,
                                   fp8_scale,
-                                  output_dtype)
+                                  output_dtype,
+                                  zero_centered_gamma,
+    )
 
 @torch.compile
 def bias_dropout_add_fused(
@@ -72,6 +77,7 @@ def bias_add_ln_fp8_te(
     eps: torch.float32,
     fp8_scale: torch.float32,
     output_dtype: torch.dtype,
+    zero_centered_gamma: bool,
     meta: tex.FP8TensorMeta,
 ) -> torch.Tensor:
     bda_out = bias_dropout_add_fused(x, bias, residual, 0, True)
@@ -86,8 +92,7 @@ def bias_add_ln_fp8_te(
                                          0, # tex.FP8FwdTensors.GEMM1_INPUT
                                          tex.DType.kFloat8E4M3, # fp8_dtype_forward
                                          0, # TODO: fwd_ln_sm_margin
-                                         #True, # zero_centered_gamma
-                                         False, # zero_centered_gamma
+                                         zero_centered_gamma,
                                          **ln_out_kwarg,
     )
     return bda_out, ln_out.view(output_dtype), meta.amax_history[0][0]
@@ -131,8 +136,9 @@ def main():
     fp8_scale = 0.5
     x_shape = (512, 1, 12288)
     w_shape = (x_shape[-1],)
-    warmup_iters = 10
-    main_iters = 1000
+    zero_centered_gamma = True
+    warmup_iters = 0
+    main_iters = 1
 
     # LayerNorm params
     ln_weight = torch.rand(w_shape, dtype=input_dtype, device='cuda', requires_grad=True)
@@ -166,6 +172,7 @@ def main():
                       eps,
                       fp8_scale,
                       output_dtype,
+                      zero_centered_gamma,
                       **kwargs)
         result_dict[impl] = result
 
