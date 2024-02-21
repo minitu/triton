@@ -1,6 +1,8 @@
 import torch
 import transformer_engine.pytorch.cpp_extensions as tex
 
+FP8_TENSOR_INDEX = 0
+
 def bias_add_ln_fp8_native(
     x: torch.Tensor,
     bias: torch.Tensor,
@@ -12,6 +14,8 @@ def bias_add_ln_fp8_native(
     fp8_scale: torch.float32,
     output_dtype: torch.dtype,
     zero_centered_gamma: bool,
+    scale_tensor: torch.Tensor,
+    amax_tensor: torch.Tensor,
 ) -> torch.Tensor:
     # Bias-Add
     out1 = (x + bias) + residual
@@ -22,37 +26,17 @@ def bias_add_ln_fp8_native(
     out2 = torch.nn.functional.layer_norm(out1, w_shape, w, ln_bias, eps)
 
     # Obtain FP8 amax
-    amax = torch.amax(torch.abs(out2)).to(torch.float32)
+    amax = torch.amax(torch.abs(out2))
+    amax_tensor.fill_(amax)
 
     # Apply FP8 scale and cast to FP8
-    out2 = (out2 * fp8_scale).to(output_dtype)
+    out2 = (out2 * scale_tensor).to(output_dtype)
 
-    return out1, out2, amax
+    return out1, out2, amax_tensor
 
 @torch.compile
-def bias_add_ln_fp8_compile(
-    x: torch.Tensor,
-    bias: torch.Tensor,
-    residual: torch.Tensor,
-    w_shape: tuple,
-    ln_weight: torch.Tensor,
-    ln_bias: torch.Tensor,
-    eps: torch.float32,
-    fp8_scale: torch.float32,
-    output_dtype: torch.dtype,
-    zero_centered_gamma: bool,
-) -> torch.Tensor:
-    return bias_add_ln_fp8_native(x,
-                                  bias,
-                                  residual,
-                                  w_shape,
-                                  ln_weight,
-                                  ln_bias,
-                                  eps,
-                                  fp8_scale,
-                                  output_dtype,
-                                  zero_centered_gamma,
-    )
+def bias_add_ln_fp8_compile(*args) -> torch.Tensor:
+    return bias_add_ln_fp8_native(*args)
 
 @torch.compile
 def bias_dropout_add_fused(
@@ -89,23 +73,24 @@ def bias_add_ln_fp8_te(
     ln_out, _, _ = tex.layernorm_fwd_fp8(*ln_in,
                                          eps,
                                          meta,
-                                         0, # tex.FP8FwdTensors.GEMM1_INPUT
+                                         FP8_TENSOR_INDEX, # tex.FP8FwdTensors.GEMM1_INPUT
                                          tex.DType.kFloat8E4M3, # fp8_dtype_forward
                                          0, # TODO: fwd_ln_sm_margin
                                          zero_centered_gamma,
                                          **ln_out_kwarg,
     )
-    return bda_out, ln_out.view(output_dtype), meta.amax_history[0][0]
+    return bda_out, ln_out.view(output_dtype), meta.amax_history[0][FP8_TENSOR_INDEX]
 
 def bias_add_ln_fp8(*args, **kwargs) -> torch.Tensor:
     impl = kwargs["impl"]
+    meta = kwargs["meta"]
 
     if impl == "native":
-        result = bias_add_ln_fp8_native(*args)
+        result = bias_add_ln_fp8_native(*args, meta.scale[FP8_TENSOR_INDEX], meta.amax_history[0][FP8_TENSOR_INDEX])
     elif impl == "compile":
-        result = bias_add_ln_fp8_compile(*args)
+        result = bias_add_ln_fp8_compile(*args, meta.scale[FP8_TENSOR_INDEX], meta.amax_history[0][FP8_TENSOR_INDEX])
     elif impl == "te":
-        result = bias_add_ln_fp8_te(*args, meta=kwargs["meta"])
+        result = bias_add_ln_fp8_te(*args, meta=meta)
     else:
         raise ValueError(f"Implementation '{impl}' is not recognized.")
 
@@ -151,16 +136,16 @@ def main():
 
     result_dict = {}
     for impl in ["native", "compile", "te"]:
+        meta = tex.FP8TensorMeta()
+        meta.scale = torch.ones(1,dtype=torch.float32, device="cuda") * fp8_scale
+        meta.scale_inv = torch.ones(1, dtype=torch.float32, device="cuda") / fp8_scale # TODO: Where is this used?
+        meta.amax_history = torch.zeros(1, 1, dtype=torch.float32, device="cuda")
+
         kwargs = {"impl": impl,
                   "warmup_iters": warmup_iters,
                   "main_iters": main_iters,
+                  "meta": meta,
                  }
-        if impl == "te":
-            meta = tex.FP8TensorMeta()
-            meta.scale = torch.ones(1,dtype=torch.float32, device="cuda") * fp8_scale
-            meta.scale_inv = torch.ones(1, dtype=torch.float32, device="cuda") / fp8_scale
-            meta.amax_history = torch.zeros(1, 1, dtype=torch.float32, device="cuda")
-            kwargs["meta"] = meta
 
         print(f"Testing {impl}...")
         result = test(x.detach().clone(),
