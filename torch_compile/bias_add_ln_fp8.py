@@ -19,7 +19,7 @@ def bias_add_ln_fp8_native(
     out2 = torch.nn.functional.layer_norm(out1.view(-1, w_shape[-1]), w_shape, ln_weight, ln_bias, eps)
 
     # Obtain FP8 amax
-    amax = torch.max(torch.abs(out2)).to(torch.float32)
+    amax = torch.amax(torch.abs(out2)).to(torch.float32)
 
     # Apply FP8 scale and cast to FP8
     out2 = (out2 * fp8_scale).to(output_dtype)
@@ -79,16 +79,17 @@ def bias_add_ln_fp8_te(
     ln_in = (bda_out, ln_weight, ln_bias)
     ln_out = torch.empty_like(bda_out, dtype=torch.uint8)
     ln_out_kwarg = {"ln_out": ln_out}
-    out = tex.layernorm_fwd_fp8(*ln_in,
-                                eps,
-                                meta,
-                                0, # tex.FP8FwdTensors.GEMM1_INPUT
-                                tex.DType.kFloat8E4M3, # fp8_dtype_forward
-                                0, # TODO: fwd_ln_sm_margin
-                                True, # zero_centered_gamma
-                                **ln_out_kwarg,
+    ln_out, _, _ = tex.layernorm_fwd_fp8(*ln_in,
+                                         eps,
+                                         meta,
+                                         0, # tex.FP8FwdTensors.GEMM1_INPUT
+                                         tex.DType.kFloat8E4M3, # fp8_dtype_forward
+                                         0, # TODO: fwd_ln_sm_margin
+                                         #True, # zero_centered_gamma
+                                         False, # zero_centered_gamma
+                                         **ln_out_kwarg,
     )
-    return out
+    return bda_out, ln_out.view(output_dtype), meta.amax_history[0][0]
 
 def bias_add_ln_fp8(*args, **kwargs) -> torch.Tensor:
     impl = kwargs["impl"]
@@ -142,8 +143,7 @@ def main():
     residual = torch.randn_like(x)
 
     result_dict = {}
-    #for impl in ["native", "compile", "te"]:
-    for impl in ["compile"]:
+    for impl in ["native", "compile", "te"]:
         kwargs = {"impl": impl,
                   "warmup_iters": warmup_iters,
                   "main_iters": main_iters,
@@ -168,8 +168,8 @@ def main():
                       **kwargs)
         result_dict[impl] = result
 
-        #print("*** " + impl + " ***")
-        #print(result_dict[impl])
+        print("*** " + impl + " ***")
+        print(result_dict[impl])
 
 if __name__ == '__main__':
     main()
