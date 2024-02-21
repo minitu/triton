@@ -14,9 +14,10 @@ def bias_add_ln_fp8_native(
 ) -> torch.Tensor:
     # Bias-Add
     out1 = (x + bias) + residual
+    out1 = out1.view(-1, w_shape[-1])
 
     # LayerNorm
-    out2 = torch.nn.functional.layer_norm(out1.view(-1, w_shape[-1]), w_shape, ln_weight, ln_bias, eps)
+    out2 = torch.nn.functional.layer_norm(out1, w_shape, ln_weight, ln_bias, eps)
 
     # Obtain FP8 amax
     amax = torch.amax(torch.abs(out2)).to(torch.float32)
@@ -170,6 +171,30 @@ def main():
 
         print("*** " + impl + " ***")
         print(result_dict[impl])
+
+    print("*** PyTorch Native vs. TE ***")
+    bda_out_diff_1 = torch.amax(torch.abs(result_dict["native"][0] - result_dict["te"][0]))
+    ln_out_diff_1 = torch.amax(torch.abs(result_dict["native"][1].to(torch.bfloat16) - result_dict["te"][1].to(torch.bfloat16)))
+    amax_diff_1 = torch.abs(result_dict["native"][2] - result_dict["te"][2])
+    print("Intermediate Bias-Dropout-Add output diff:", bda_out_diff_1.item())
+    print("LayerNorm-FP8_Cast output diff (FP8 cast to BF16 for comparison):", ln_out_diff_1.item())
+    print("Amax diff:", amax_diff_1.item())
+
+    print("*** PyTorch Native vs. torch.compile ***")
+    bda_out_diff_2 = torch.amax(torch.abs(result_dict["native"][0] - result_dict["compile"][0]))
+    ln_out_diff_2 = torch.amax(torch.abs(result_dict["native"][1].to(torch.bfloat16) - result_dict["compile"][1].to(torch.bfloat16)))
+    amax_diff_2 = torch.abs(result_dict["native"][2] - result_dict["compile"][2])
+    print("Intermediate Bias-Dropout-Add output diff:", bda_out_diff_2.item())
+    print("LayerNorm-FP8_Cast output diff (FP8 cast to BF16 for comparison):", ln_out_diff_2.item())
+    print("Amax diff:", amax_diff_2.item())
+
+    print("*** TE vs. torch.compile ***")
+    bda_out_diff_3 = torch.amax(torch.abs(result_dict["te"][0] - result_dict["compile"][0]))
+    ln_out_diff_3 = torch.amax(torch.abs(result_dict["te"][1].to(torch.bfloat16) - result_dict["compile"][1].to(torch.bfloat16)))
+    amax_diff_3 = torch.abs(result_dict["te"][2] - result_dict["compile"][2])
+    print("Intermediate Bias-Dropout-Add output diff:", bda_out_diff_3.item())
+    print("LayerNorm-FP8_Cast output diff (FP8 cast to BF16 for comparison):", ln_out_diff_3.item())
+    print("Amax diff:", amax_diff_3.item())
 
 if __name__ == '__main__':
     main()
