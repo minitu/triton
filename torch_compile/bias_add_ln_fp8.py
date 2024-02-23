@@ -107,6 +107,7 @@ class BiasAddLayerNormFP8(torch.nn.Module):
         super().__init__()
 
     def forward(
+        self,
         x: torch.Tensor,
         bias: torch.Tensor,
         residual: torch.Tensor,
@@ -123,43 +124,11 @@ class BiasAddLayerNormFP8(torch.nn.Module):
         bda_out = bda_out.view(-1, w_shape[-1])
 
         ln_out = _LayerNormFP8.apply(bda_out, ln_weight, ln_bias, eps,
-                                     fp8_scale, zero_centered_gamma, meta)
+                                     zero_centered_gamma, meta)
 
-        return bda_out, ln_out, meta.amax_history[0][FP8_TENSOR_INDEX]
+        return bda_out, ln_out.view(output_dtype), meta.amax_history[0][FP8_TENSOR_INDEX]
 
 bias_add_ln_fp8_te = BiasAddLayerNormFP8()
-
-'''
-def bias_add_ln_fp8_te(
-    x: torch.Tensor,
-    bias: torch.Tensor,
-    residual: torch.Tensor,
-    w_shape: tuple,
-    ln_weight: torch.Tensor,
-    ln_bias: torch.Tensor,
-    eps: torch.float32,
-    fp8_scale: torch.float32,
-    output_dtype: torch.dtype,
-    zero_centered_gamma: bool,
-    meta: tex.FP8TensorMeta,
-) -> torch.Tensor:
-    bda_out = bias_dropout_add_fused(x, bias, residual, 0, True)
-    bda_out = bda_out.view(-1, w_shape[-1])
-
-    ln_in = (bda_out, ln_weight, ln_bias)
-    ln_out = torch.empty_like(bda_out, dtype=torch.uint8)
-    ln_out_kwarg = {"ln_out": ln_out}
-    ln_out, _, _ = tex.layernorm_fwd_fp8(*ln_in,
-                                         eps,
-                                         meta,
-                                         FP8_TENSOR_INDEX, # tex.FP8FwdTensors.GEMM1_INPUT
-                                         tex.DType.kFloat8E4M3, # fp8_dtype_forward
-                                         0, # TODO: fwd_ln_sm_margin
-                                         zero_centered_gamma,
-                                         **ln_out_kwarg,
-    )
-    return bda_out, ln_out.view(output_dtype), meta.amax_history[0][FP8_TENSOR_INDEX]
-'''
 
 def bias_add_ln_fp8(*args, **kwargs) -> torch.Tensor:
     impl = kwargs["impl"]
@@ -182,12 +151,16 @@ def test(*args, **kwargs) -> torch.Tensor:
     main_iters = kwargs["main_iters"]
     do_bprop = kwargs["do_bprop"]
 
+    loss = torch.nn.MSELoss()
+
     print(f"Running {warmup_iters} warmup iters for {impl}...")
     for i in range(warmup_iters):
         result = bias_add_ln_fp8(*args, **kwargs)
         if do_bprop:
             y = result[0].sum()
-            y.backward()
+            y_ = torch.zeros_like(y)
+            diff = loss(y, y_)
+            diff.backward(retain_graph=True)
 
     torch.cuda.profiler.start()
     print(f"Running {main_iters} main iters for {impl}...")
@@ -195,12 +168,17 @@ def test(*args, **kwargs) -> torch.Tensor:
         result = bias_add_ln_fp8(*args, **kwargs)
         if do_bprop:
             y = result[0].sum()
-            y.backward()
+            y_ = torch.zeros_like(y)
+            diff = loss(y, y_)
+            diff.backward(retain_graph=True)
     torch.cuda.profiler.stop()
 
     return result
 
 def main():
+    # Implementations
+    all_impls = ["native", "compile", "te"]
+
     # Settings - BF16 input, FP8 output
     input_dtype = torch.bfloat16
     output_dtype = torch.float8_e4m3fn
@@ -209,10 +187,10 @@ def main():
     x_shape = (512, 1, 12288)
     w_shape = (x_shape[-1],)
     zero_centered_gamma = True
-    warmup_iters = 0
-    main_iters = 1
+    warmup_iters = 10
+    main_iters = 100
     do_bprop = True
-    compare = False
+    compare = True
 
     # LayerNorm params
     ln_weight = torch.rand(w_shape, dtype=input_dtype, device='cuda', requires_grad=True)
@@ -223,9 +201,10 @@ def main():
     bias = torch.randn(w_shape, dtype=input_dtype, device='cuda', requires_grad=True)
     residual = torch.randn_like(x)
 
-    result_dict = {}
-    #for impl in ["native", "compile", "te"]:
-    for impl in ["te"]:
+    fprop_result = {}
+    bprop_result = {}
+    for impl in all_impls:
+    #for impl in ["compile"]:
         meta = tex.FP8TensorMeta()
         meta.scale = torch.ones(1,dtype=torch.float32, device="cuda") * fp8_scale
         meta.scale_inv = torch.ones(1, dtype=torch.float32, device="cuda") / fp8_scale # TODO: Where is this used?
@@ -239,46 +218,64 @@ def main():
                  }
 
         print(f"Testing {impl}...")
-        result = test(x.detach().clone().requires_grad_(),
-                      bias.detach().clone().requires_grad_(),
-                      residual.detach().clone().requires_grad_(),
+        x_clone = x.detach().clone().requires_grad_()
+        bias_clone = bias.detach().clone().requires_grad_()
+        residual_clone = residual.detach().clone().requires_grad_()
+        ln_weight_clone = ln_weight.detach().clone().requires_grad_()
+        ln_bias_clone = ln_bias.detach().clone().requires_grad_()
+        result = test(x_clone,
+                      bias_clone,
+                      residual_clone,
                       w_shape,
-                      ln_weight.detach().clone().requires_grad_(),
-                      ln_bias.detach().clone().requires_grad_(),
+                      ln_weight_clone,
+                      ln_bias_clone,
                       eps,
                       fp8_scale,
                       output_dtype,
                       zero_centered_gamma,
                       **kwargs)
-        result_dict[impl] = result
-
-        print("*** " + impl + " ***")
-        print(result_dict[impl])
+        fprop_result[impl] = result
+        bprop_result[impl] = {
+                "x.wgrad": x_clone.grad,
+                "bias.wgrad": bias_clone.grad,
+                "residual.wgrad": residual_clone.grad,
+                "ln_weight.wgrad": ln_weight_clone.grad,
+                "ln_bias.wgrad": ln_bias_clone.grad
+        }
 
     if compare:
-        print("*** PyTorch Native vs. TE ***")
-        bda_out_diff_1 = torch.amax(torch.abs(result_dict["native"][0] - result_dict["te"][0]))
-        ln_out_diff_1 = torch.amax(torch.abs(result_dict["native"][1].to(torch.bfloat16) - result_dict["te"][1].to(torch.bfloat16)))
-        amax_diff_1 = torch.abs(result_dict["native"][2] - result_dict["te"][2])
-        print("Intermediate Bias-Dropout-Add output diff:", bda_out_diff_1.item())
-        print("LayerNorm-FP8_Cast output diff (FP8 cast to BF16 for comparison):", ln_out_diff_1.item())
-        print("Amax diff:", amax_diff_1.item())
+        print("\nComparing fprop...\n")
+        for i in range(len(all_impls)):
+            for j in range(i+1, len(all_impls)):
+                impl_cur = all_impls[i]
+                impl_ref = all_impls[j]
+                print("[" + impl_cur + "] vs. [" + impl_ref + "]")
+                bda_out_diff = torch.amax(torch.abs(fprop_result[impl_cur][0] - fprop_result[impl_ref][0]))
+                ln_out_diff = torch.amax(torch.abs(fprop_result[impl_cur][1].to(torch.bfloat16) - fprop_result[impl_ref][1].to(torch.bfloat16)))
+                amax_diff = torch.abs(fprop_result[impl_cur][2] - fprop_result[impl_ref][2])
+                print("Intermediate Bias-Dropout-Add output diff:", bda_out_diff.item())
+                print("LayerNorm-FP8_Cast output diff (FP8 cast to BF16 for comparison):", ln_out_diff.item())
+                print("Amax diff:", amax_diff.item())
+                print()
 
-        print("*** PyTorch Native vs. torch.compile ***")
-        bda_out_diff_2 = torch.amax(torch.abs(result_dict["native"][0] - result_dict["compile"][0]))
-        ln_out_diff_2 = torch.amax(torch.abs(result_dict["native"][1].to(torch.bfloat16) - result_dict["compile"][1].to(torch.bfloat16)))
-        amax_diff_2 = torch.abs(result_dict["native"][2] - result_dict["compile"][2])
-        print("Intermediate Bias-Dropout-Add output diff:", bda_out_diff_2.item())
-        print("LayerNorm-FP8_Cast output diff (FP8 cast to BF16 for comparison):", ln_out_diff_2.item())
-        print("Amax diff:", amax_diff_2.item())
-
-        print("*** TE vs. torch.compile ***")
-        bda_out_diff_3 = torch.amax(torch.abs(result_dict["te"][0] - result_dict["compile"][0]))
-        ln_out_diff_3 = torch.amax(torch.abs(result_dict["te"][1].to(torch.bfloat16) - result_dict["compile"][1].to(torch.bfloat16)))
-        amax_diff_3 = torch.abs(result_dict["te"][2] - result_dict["compile"][2])
-        print("Intermediate Bias-Dropout-Add output diff:", bda_out_diff_3.item())
-        print("LayerNorm-FP8_Cast output diff (FP8 cast to BF16 for comparison):", ln_out_diff_3.item())
-        print("Amax diff:", amax_diff_3.item())
+        if do_bprop:
+            print("Comparing bprop...\n")
+            for i in range(len(all_impls)):
+                for j in range(i+1, len(all_impls)):
+                    impl_cur = all_impls[i]
+                    impl_ref = all_impls[j]
+                    print("[" + impl_cur + "] vs. [" + impl_ref + "]")
+                    for key in bprop_result[impl_cur].keys():
+                        has_none = False
+                        if bprop_result[impl_cur][key] is None:
+                            print(f"{impl_cur} has None for {key}")
+                            has_none = True
+                        if bprop_result[impl_ref][key] is None:
+                            print(f"{impl_ref} has None for {key}")
+                            has_none = True
+                        if not has_none:
+                            print(key + ":", torch.amax(torch.abs(bprop_result[impl_cur][key] - bprop_result[impl_ref][key])))
+                    print()
 
 if __name__ == '__main__':
     main()
