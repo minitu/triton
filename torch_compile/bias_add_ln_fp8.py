@@ -165,12 +165,16 @@ def test(*args, **kwargs) -> torch.Tensor:
     torch.cuda.profiler.start()
     print(f"Running {main_iters} main iters for {impl}...")
     for i in range(main_iters):
+        torch.cuda.nvtx.range_push("fprop")
         result = bias_add_ln_fp8(*args, **kwargs)
+        torch.cuda.nvtx.range_pop()
         if do_bprop:
             y = result[0].sum()
             y_ = torch.zeros_like(y)
             diff = loss(y, y_)
+            torch.cuda.nvtx.range_push("bprop")
             diff.backward(retain_graph=True)
+            torch.cuda.nvtx.range_pop()
     torch.cuda.profiler.stop()
 
     return result
