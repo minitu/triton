@@ -145,40 +145,6 @@ def bias_add_ln_fp8(*args, **kwargs) -> torch.Tensor:
 
     return result
 
-def test(*args, **kwargs) -> torch.Tensor:
-    impl = kwargs["impl"]
-    warmup_iters = kwargs["warmup_iters"]
-    main_iters = kwargs["main_iters"]
-    do_bprop = kwargs["do_bprop"]
-
-    loss = torch.nn.MSELoss()
-
-    print(f"Running {warmup_iters} warmup iters for {impl}...")
-    for i in range(warmup_iters):
-        result = bias_add_ln_fp8(*args, **kwargs)
-        if do_bprop:
-            y = result[0].sum()
-            y_ = torch.zeros_like(y)
-            diff = loss(y, y_)
-            diff.backward(retain_graph=True)
-
-    torch.cuda.profiler.start()
-    print(f"Running {main_iters} main iters for {impl}...")
-    for i in range(main_iters):
-        torch.cuda.nvtx.range_push("fprop")
-        result = bias_add_ln_fp8(*args, **kwargs)
-        torch.cuda.nvtx.range_pop()
-        if do_bprop:
-            y = result[0].sum()
-            y_ = torch.zeros_like(y)
-            diff = loss(y, y_)
-            torch.cuda.nvtx.range_push("bprop")
-            diff.backward(retain_graph=True)
-            torch.cuda.nvtx.range_pop()
-    torch.cuda.profiler.stop()
-
-    return result
-
 def main():
     # Implementations
     all_impls = ["native", "compile", "te"]
@@ -209,42 +175,105 @@ def main():
     bprop_result = {}
     for impl in all_impls:
     #for impl in ["compile"]:
-        meta = tex.FP8TensorMeta()
-        meta.scale = torch.ones(1,dtype=torch.float32, device="cuda") * fp8_scale
-        meta.scale_inv = torch.ones(1, dtype=torch.float32, device="cuda") / fp8_scale # TODO: Where is this used?
-        meta.amax_history = torch.zeros(1, 1, dtype=torch.float32, device="cuda")
+        ln_weight_impl = ln_weight.detach().clone().requires_grad_()
+        ln_bias_impl = ln_bias.detach().clone().requires_grad_()
+        x_impl = x.detach().clone().requires_grad_()
+        bias_impl = bias.detach().clone().requires_grad_()
+        residual_impl = residual.detach().clone().requires_grad_()
+
 
         kwargs = {"impl": impl,
                   "warmup_iters": warmup_iters,
                   "main_iters": main_iters,
-                  "meta": meta,
                   "do_bprop": do_bprop,
                  }
 
         print(f"Testing {impl}...")
-        x_clone = x.detach().clone().requires_grad_()
-        bias_clone = bias.detach().clone().requires_grad_()
-        residual_clone = residual.detach().clone().requires_grad_()
-        ln_weight_clone = ln_weight.detach().clone().requires_grad_()
-        ln_bias_clone = ln_bias.detach().clone().requires_grad_()
-        result = test(x_clone,
-                      bias_clone,
-                      residual_clone,
-                      w_shape,
-                      ln_weight_clone,
-                      ln_bias_clone,
-                      eps,
-                      fp8_scale,
-                      output_dtype,
-                      zero_centered_gamma,
-                      **kwargs)
+
+        loss = torch.nn.MSELoss()
+
+        print(f"Running {warmup_iters} warmup iters for {impl}...")
+        for i in range(warmup_iters):
+            x_clone = x_impl.detach().clone().requires_grad_()
+            bias_clone = bias_impl.detach().clone().requires_grad_()
+            residual_clone = residual_impl.detach().clone().requires_grad_()
+
+            meta = tex.FP8TensorMeta()
+            meta.scale = torch.ones(1,dtype=torch.float32, device="cuda") * fp8_scale
+            meta.scale_inv = torch.ones(1, dtype=torch.float32, device="cuda") / fp8_scale # TODO: Where is this used?
+            meta.amax_history = torch.zeros(1, 1, dtype=torch.float32, device="cuda")
+            kwargs["meta"] = meta
+
+            result = bias_add_ln_fp8(
+                x_clone,
+                bias_clone,
+                residual_clone,
+                w_shape,
+                ln_weight_impl,
+                ln_bias_impl,
+                eps,
+                fp8_scale,
+                output_dtype,
+                zero_centered_gamma,
+                **kwargs)
+
+            if do_bprop:
+                y = result[1].to(torch.bfloat16).mean()
+                z = y.backward()
+
+        torch.cuda.profiler.start()
+        print(f"Running {main_iters} main iters for {impl}...")
+        for i in range(main_iters):
+            torch.cuda.nvtx.range_push("setup")
+
+            x_clone = x_impl.detach().clone().requires_grad_()
+            bias_clone = bias_impl.detach().clone().requires_grad_()
+            residual_clone = residual_impl.detach().clone().requires_grad_()
+
+            meta = tex.FP8TensorMeta()
+            meta.scale = torch.ones(1,dtype=torch.float32, device="cuda") * fp8_scale
+            meta.scale_inv = torch.ones(1, dtype=torch.float32, device="cuda") / fp8_scale # TODO: Where is this used?
+            meta.amax_history = torch.zeros(1, 1, dtype=torch.float32, device="cuda")
+            kwargs["meta"] = meta
+
+            torch.cuda.nvtx.range_pop()
+            torch.cuda.nvtx.range_push("fprop")
+
+            result = bias_add_ln_fp8(
+                x_clone,
+                bias_clone,
+                residual_clone,
+                w_shape,
+                ln_weight_impl,
+                ln_bias_impl,
+                eps,
+                fp8_scale,
+                output_dtype,
+                zero_centered_gamma,
+                **kwargs)
+
+            torch.cuda.nvtx.range_pop()
+
+            if do_bprop:
+                torch.cuda.nvtx.range_push("loss")
+
+                y = result[1].to(torch.bfloat16).mean()
+
+                torch.cuda.nvtx.range_pop()
+                torch.cuda.nvtx.range_push("bprop")
+
+                z = y.backward()
+
+                torch.cuda.nvtx.range_pop()
+        torch.cuda.profiler.stop()
+
         fprop_result[impl] = result
         bprop_result[impl] = {
                 "x.wgrad": x_clone.grad,
                 "bias.wgrad": bias_clone.grad,
                 "residual.wgrad": residual_clone.grad,
-                "ln_weight.wgrad": ln_weight_clone.grad,
-                "ln_bias.wgrad": ln_bias_clone.grad
+                "ln_weight.wgrad": ln_weight_impl.grad,
+                "ln_bias.wgrad": ln_bias_impl.grad
         }
 
     if compare:
