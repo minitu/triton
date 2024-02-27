@@ -60,7 +60,9 @@ class _LayerNormFP8(torch.autograd.Function):
         ln_bias: torch.Tensor,
         eps: torch.float32,
         zero_centered_gamma: bool,
+        output_dtype: torch.dtype,
         meta: tex.FP8TensorMeta,
+        do_bprop: bool
     ):
         ln_out = torch.empty_like(inp, dtype=torch.uint8)
         ln_out_kwarg = {"ln_out": ln_out}
@@ -75,14 +77,19 @@ class _LayerNormFP8(torch.autograd.Function):
                                              zero_centered_gamma,
                                              **ln_out_kwarg,
         )
+        if do_bprop:
+            # Cast LN output to BF16 for bprop, need to remove from perf cost
+            #ln_out = ln_out.to(torch.bfloat16)
+            ln_out = ln_out.view(output_dtype)
+            ln_out.requires_grad_()
 
-        ctx.save_for_backward(
-            inp,
-            ln_weight,
-            mu,
-            rsigma
-        )
-        ctx.zero_centered_gamma = zero_centered_gamma
+            ctx.save_for_backward(
+                inp,
+                ln_weight,
+                mu,
+                rsigma
+            )
+            ctx.zero_centered_gamma = zero_centered_gamma
 
         return ln_out
 
@@ -93,14 +100,22 @@ class _LayerNormFP8(torch.autograd.Function):
     ):
         (inp, ln_weight, mu, rsigma) = ctx.saved_tensors
 
+        # Incoming grad cast to BF16, need to remove from perf cost
         dgrad, dgamma, dbeta = tex.layernorm_bwd(
-            grad_output, inp, mu, rsigma, ln_weight, 0, ctx.zero_centered_gamma
+            #grad_output, inp, mu, rsigma, ln_weight, 0, ctx.zero_centered_gamma
+            grad_output.to(torch.bfloat16), inp, mu, rsigma, ln_weight, 0, ctx.zero_centered_gamma
         )
 
         return (
             dgrad,
             dgamma,
-            dbeta)
+            dbeta,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
 
 class BiasAddLayerNormFP8(torch.nn.Module):
     def __init__(self):
@@ -119,27 +134,31 @@ class BiasAddLayerNormFP8(torch.nn.Module):
         output_dtype: torch.dtype,
         zero_centered_gamma: bool,
         meta: tex.FP8TensorMeta,
+        do_bprop: bool,
     ):
         bda_out = bias_dropout_add_fused(x, bias, residual, 0, True)
         bda_out = bda_out.view(-1, w_shape[-1])
 
         ln_out = _LayerNormFP8.apply(bda_out, ln_weight, ln_bias, eps,
-                                     zero_centered_gamma, meta)
+                                     zero_centered_gamma, output_dtype, meta, do_bprop)
+        #ln_out_ret = ln_out.to(output_dtype) if do_bprop else ln_out.view(output_dtype)
+        ln_out_ret = ln_out if do_bprop else ln_out.view(output_dtype)
 
-        return bda_out, ln_out.view(output_dtype), meta.amax_history[0][FP8_TENSOR_INDEX]
+        return bda_out, ln_out_ret, meta.amax_history[0][FP8_TENSOR_INDEX]
 
 bias_add_ln_fp8_te = BiasAddLayerNormFP8()
 
 def bias_add_ln_fp8(*args, **kwargs) -> torch.Tensor:
     impl = kwargs["impl"]
     meta = kwargs["meta"]
+    do_bprop = kwargs["do_bprop"]
 
     if impl == "native":
         result = bias_add_ln_fp8_native(*args, meta.scale[FP8_TENSOR_INDEX], meta.amax_history[0][FP8_TENSOR_INDEX])
     elif impl == "compile":
         result = bias_add_ln_fp8_compile(*args, meta.scale[FP8_TENSOR_INDEX], meta.amax_history[0][FP8_TENSOR_INDEX])
     elif impl == "te":
-        result = bias_add_ln_fp8_te(*args, meta=meta)
+        result = bias_add_ln_fp8_te(*args, meta=meta, do_bprop=do_bprop)
     else:
         raise ValueError(f"Implementation '{impl}' is not recognized.")
 
@@ -174,7 +193,7 @@ def main():
     fprop_result = {}
     bprop_result = {}
     for impl in all_impls:
-    #for impl in ["compile"]:
+    #for impl in ["te"]:
         ln_weight_impl = ln_weight.detach().clone().requires_grad_()
         ln_bias_impl = ln_bias.detach().clone().requires_grad_()
         x_impl = x.detach().clone().requires_grad_()
@@ -219,7 +238,7 @@ def main():
 
             if do_bprop:
                 y = result[1].to(torch.bfloat16).mean()
-                z = y.backward()
+                y.backward()
 
         torch.cuda.profiler.start()
         print(f"Running {main_iters} main iters for {impl}...")
@@ -262,7 +281,7 @@ def main():
                 torch.cuda.nvtx.range_pop()
                 torch.cuda.nvtx.range_push("bprop")
 
-                z = y.backward()
+                y.backward()
 
                 torch.cuda.nvtx.range_pop()
         torch.cuda.profiler.stop()
@@ -277,6 +296,7 @@ def main():
         }
 
     if compare:
+        # TODO: TE fprop output is not correct when bprop is enabled
         print("\nComparing fprop...\n")
         for i in range(len(all_impls)):
             for j in range(i+1, len(all_impls)):
