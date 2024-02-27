@@ -64,8 +64,11 @@ class _LayerNormFP8(torch.autograd.Function):
         meta: tex.FP8TensorMeta,
         do_bprop: bool
     ):
+        torch.cuda.nvtx.range_push("TE forward empty_like")
         ln_out = torch.empty_like(inp, dtype=torch.uint8)
+        torch.cuda.nvtx.range_pop()
         ln_out_kwarg = {"ln_out": ln_out}
+        torch.cuda.nvtx.range_push("TE layernorm_fwd_fp8")
         ln_out, mu, rsigma = tex.layernorm_fwd_fp8(inp,
                                              ln_weight,
                                              ln_bias,
@@ -77,12 +80,16 @@ class _LayerNormFP8(torch.autograd.Function):
                                              zero_centered_gamma,
                                              **ln_out_kwarg,
         )
+        torch.cuda.nvtx.range_pop()
         if do_bprop:
             # Cast LN output to BF16 for bprop, need to remove from perf cost
             #ln_out = ln_out.to(torch.bfloat16)
+            torch.cuda.nvtx.range_push("TE forward view, requires_grad")
             ln_out = ln_out.view(output_dtype)
             ln_out.requires_grad_()
+            torch.cuda.nvtx.range_pop()
 
+            torch.cuda.nvtx.range_push("TE forward save")
             ctx.save_for_backward(
                 inp,
                 ln_weight,
@@ -90,6 +97,7 @@ class _LayerNormFP8(torch.autograd.Function):
                 rsigma
             )
             ctx.zero_centered_gamma = zero_centered_gamma
+            torch.cuda.nvtx.range_pop()
 
         return ln_out
 
@@ -101,10 +109,14 @@ class _LayerNormFP8(torch.autograd.Function):
         (inp, ln_weight, mu, rsigma) = ctx.saved_tensors
 
         # Incoming grad cast to BF16, need to remove from perf cost
+        torch.cuda.nvtx.range_push("TE backward cast")
+        grad_output_bf16 = grad_output.to(torch.bfloat16)
+        torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_push("TE layernorm_bwd")
         dgrad, dgamma, dbeta = tex.layernorm_bwd(
-            #grad_output, inp, mu, rsigma, ln_weight, 0, ctx.zero_centered_gamma
-            grad_output.to(torch.bfloat16), inp, mu, rsigma, ln_weight, 0, ctx.zero_centered_gamma
+            grad_output_bf16, inp, mu, rsigma, ln_weight, 0, ctx.zero_centered_gamma
         )
+        torch.cuda.nvtx.range_pop()
 
         return (
             dgrad,
