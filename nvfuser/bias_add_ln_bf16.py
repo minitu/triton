@@ -3,7 +3,7 @@ import transformer_engine.pytorch.cpp_extensions as tex
 
 FP8_TENSOR_INDEX = 0
 
-def bias_add_ln_fp8_native(
+def bias_add_ln_native(
     x: torch.Tensor,
     bias: torch.Tensor,
     residual: torch.Tensor,
@@ -11,7 +11,6 @@ def bias_add_ln_fp8_native(
     ln_weight: torch.Tensor,
     ln_bias: torch.Tensor,
     eps: torch.float32,
-    fp8_scale: torch.float32,
     output_dtype: torch.dtype,
     zero_centered_gamma: bool,
     scale_tensor: torch.Tensor,
@@ -29,14 +28,14 @@ def bias_add_ln_fp8_native(
     amax = torch.amax(torch.abs(out2))
     amax_tensor.fill_(amax)
 
-    # Apply FP8 scale and cast to FP8
-    out2 = (out2 * scale_tensor).to(output_dtype)
+    # Apply FP8 scale
+    out2 = (out2 * scale_tensor)
 
     return out1, out2, amax_tensor
 
 @torch.compile
-def bias_add_ln_fp8_compile(*args) -> torch.Tensor:
-    return bias_add_ln_fp8_native(*args)
+def bias_add_ln_compile(*args) -> torch.Tensor:
+    return bias_add_ln_native(*args)
 
 @torch.compile
 def bias_dropout_add_fused(
@@ -81,11 +80,15 @@ class _LayerNormFP8(torch.autograd.Function):
                                              **ln_out_kwarg,
         )
         torch.cuda.nvtx.range_pop()
+
+        # Cast LN output to BF16, need to remove from perf cost
+        torch.cuda.nvtx.range_push("TE forward BF16 cast")
+        ln_out = ln_out.to(output_dtype)
+        torch.cuda.nvtx.range_pop()
+
         if do_bprop:
-            # Cast LN output to BF16 for bprop, need to remove from perf cost
-            #ln_out = ln_out.to(torch.bfloat16)
-            torch.cuda.nvtx.range_push("TE forward view, requires_grad")
-            ln_out = ln_out.view(output_dtype)
+            torch.cuda.nvtx.range_push("TE forward requires_grad")
+            #ln_out = ln_out.view(output_dtype)
             ln_out.requires_grad_()
             torch.cuda.nvtx.range_pop()
 
@@ -108,13 +111,9 @@ class _LayerNormFP8(torch.autograd.Function):
     ):
         (inp, ln_weight, mu, rsigma) = ctx.saved_tensors
 
-        # Incoming grad cast to BF16, need to remove from perf cost
-        torch.cuda.nvtx.range_push("TE backward cast")
-        grad_output_bf16 = grad_output.to(torch.bfloat16)
-        torch.cuda.nvtx.range_pop()
         torch.cuda.nvtx.range_push("TE layernorm_bwd")
         dgrad, dgamma, dbeta = tex.layernorm_bwd(
-            grad_output_bf16, inp, mu, rsigma, ln_weight, 0, ctx.zero_centered_gamma
+            grad_output, inp, mu, rsigma, ln_weight, 0, ctx.zero_centered_gamma
         )
         torch.cuda.nvtx.range_pop()
 
@@ -142,7 +141,6 @@ class BiasAddLayerNormFP8(torch.nn.Module):
         ln_weight: torch.Tensor,
         ln_bias: torch.Tensor,
         eps: torch.float32,
-        fp8_scale: torch.float32,
         output_dtype: torch.dtype,
         zero_centered_gamma: bool,
         meta: tex.FP8TensorMeta,
@@ -153,24 +151,22 @@ class BiasAddLayerNormFP8(torch.nn.Module):
 
         ln_out = _LayerNormFP8.apply(bda_out, ln_weight, ln_bias, eps,
                                      zero_centered_gamma, output_dtype, meta, do_bprop)
-        #ln_out_ret = ln_out.to(output_dtype) if do_bprop else ln_out.view(output_dtype)
-        ln_out_ret = ln_out if do_bprop else ln_out.view(output_dtype)
 
-        return bda_out, ln_out_ret, meta.amax_history[0][FP8_TENSOR_INDEX]
+        return bda_out, ln_out, meta.amax_history[0][FP8_TENSOR_INDEX]
 
-bias_add_ln_fp8_te = BiasAddLayerNormFP8()
+bias_add_ln_te = BiasAddLayerNormFP8()
 
-def bias_add_ln_fp8(*args, **kwargs) -> torch.Tensor:
+def bias_add_ln(*args, **kwargs) -> torch.Tensor:
     impl = kwargs["impl"]
     meta = kwargs["meta"]
     do_bprop = kwargs["do_bprop"]
 
     if impl == "native":
-        result = bias_add_ln_fp8_native(*args, meta.scale[FP8_TENSOR_INDEX], meta.amax_history[0][FP8_TENSOR_INDEX])
+        result = bias_add_ln_native(*args, meta.scale[FP8_TENSOR_INDEX], meta.amax_history[0][FP8_TENSOR_INDEX])
     elif impl == "compile":
-        result = bias_add_ln_fp8_compile(*args, meta.scale[FP8_TENSOR_INDEX], meta.amax_history[0][FP8_TENSOR_INDEX])
+        result = bias_add_ln_compile(*args, meta.scale[FP8_TENSOR_INDEX], meta.amax_history[0][FP8_TENSOR_INDEX])
     elif impl == "te":
-        result = bias_add_ln_fp8_te(*args, meta=meta, do_bprop=do_bprop)
+        result = bias_add_ln_te(*args, meta=meta, do_bprop=do_bprop)
     else:
         raise ValueError(f"Implementation '{impl}' is not recognized.")
 
@@ -180,16 +176,16 @@ def main():
     # Implementations
     all_impls = ["native", "compile", "te"]
 
-    # Settings - BF16 input, FP8 output
+    # Settings - BF16 input/output
     input_dtype = torch.bfloat16
-    output_dtype = torch.float8_e4m3fn
+    output_dtype = torch.bfloat16
     eps = 1e-5
     fp8_scale = 0.5
     x_shape = (512, 1, 12288)
     w_shape = (x_shape[-1],)
     zero_centered_gamma = True
     warmup_iters = 10
-    main_iters = 100
+    main_iters = 1000
     do_bprop = True
     compare = True
 
@@ -227,11 +223,11 @@ def main():
 
             meta = tex.FP8TensorMeta()
             meta.scale = torch.ones(1,dtype=torch.float32, device="cuda") * fp8_scale
-            meta.scale_inv = torch.ones(1, dtype=torch.float32, device="cuda") / fp8_scale # TODO: Where is this used?
+            meta.scale_inv = torch.ones(1, dtype=torch.float32, device="cuda") / fp8_scale # Needed for TE
             meta.amax_history = torch.zeros(1, 1, dtype=torch.float32, device="cuda")
             kwargs["meta"] = meta
 
-            result = bias_add_ln_fp8(
+            result = bias_add_ln(
                 x_clone,
                 bias_clone,
                 residual_clone,
@@ -239,13 +235,12 @@ def main():
                 ln_weight_impl,
                 ln_bias_impl,
                 eps,
-                fp8_scale,
                 output_dtype,
                 zero_centered_gamma,
                 **kwargs)
 
             if do_bprop:
-                y = result[1].to(torch.bfloat16).mean()
+                y = result[1].mean()
                 y.backward()
 
         print(f"Running {main_iters} main iters for {impl}...")
@@ -259,14 +254,14 @@ def main():
 
             meta = tex.FP8TensorMeta()
             meta.scale = torch.ones(1,dtype=torch.float32, device="cuda") * fp8_scale
-            meta.scale_inv = torch.ones(1, dtype=torch.float32, device="cuda") / fp8_scale # TODO: Where is this used?
+            meta.scale_inv = torch.ones(1, dtype=torch.float32, device="cuda") / fp8_scale # Needed for TE
             meta.amax_history = torch.zeros(1, 1, dtype=torch.float32, device="cuda")
             kwargs["meta"] = meta
 
             torch.cuda.nvtx.range_pop()
             torch.cuda.nvtx.range_push("fprop")
 
-            result = bias_add_ln_fp8(
+            result = bias_add_ln(
                 x_clone,
                 bias_clone,
                 residual_clone,
@@ -274,7 +269,6 @@ def main():
                 ln_weight_impl,
                 ln_bias_impl,
                 eps,
-                fp8_scale,
                 output_dtype,
                 zero_centered_gamma,
                 **kwargs)
@@ -284,7 +278,7 @@ def main():
             if do_bprop:
                 torch.cuda.nvtx.range_push("loss")
 
-                y = result[1].to(torch.bfloat16).mean()
+                y = result[1].mean()
 
                 torch.cuda.nvtx.range_pop()
                 torch.cuda.nvtx.range_push("bprop")
@@ -311,10 +305,10 @@ def main():
                 impl_ref = all_impls[j]
                 print("[" + impl_cur + "] vs. [" + impl_ref + "]")
                 bda_out_diff = torch.amax(torch.abs(fprop_result[impl_cur][0] - fprop_result[impl_ref][0]))
-                ln_out_diff = torch.amax(torch.abs(fprop_result[impl_cur][1].to(torch.bfloat16) - fprop_result[impl_ref][1].to(torch.bfloat16)))
+                ln_out_diff = torch.amax(torch.abs(fprop_result[impl_cur][1] - fprop_result[impl_ref][1]))
                 amax_diff = torch.abs(fprop_result[impl_cur][2] - fprop_result[impl_ref][2])
                 print("Intermediate Bias-Dropout-Add output diff:", bda_out_diff.item())
-                print("LayerNorm-FP8_Cast output diff (FP8 cast to BF16 for comparison):", ln_out_diff.item())
+                print("LayerNorm output diff:", ln_out_diff.item())
                 print("Amax diff:", amax_diff.item())
                 print()
 
