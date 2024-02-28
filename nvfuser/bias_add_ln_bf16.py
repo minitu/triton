@@ -1,8 +1,11 @@
 import torch
 import transformer_engine.pytorch.cpp_extensions as tex
+import nvfuser
+from nvfuser.pytorch_utils import torch_dtype_to_nvfuser_dtype
 
 FP8_TENSOR_INDEX = 0
 
+# ------------------------------ Native ------------------------------
 def bias_add_ln_native(
     x: torch.Tensor,
     bias: torch.Tensor,
@@ -33,10 +36,12 @@ def bias_add_ln_native(
 
     return out1, out2, amax_tensor
 
+# ------------------------------ Compile ------------------------------
 @torch.compile
 def bias_add_ln_compile(*args) -> torch.Tensor:
     return bias_add_ln_native(*args)
 
+# ------------------------------ TE ------------------------------
 @torch.compile
 def bias_dropout_add_fused(
     x: torch.Tensor,
@@ -50,7 +55,7 @@ def bias_dropout_add_fused(
     out = residual + out
     return out
 
-class _LayerNormFP8(torch.autograd.Function):
+class _LayerNormFP8TE(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx,
@@ -128,7 +133,7 @@ class _LayerNormFP8(torch.autograd.Function):
             None,
         )
 
-class BiasAddLayerNormFP8(torch.nn.Module):
+class BiasAddLayerNormFP8TE(torch.nn.Module):
     def __init__(self):
         super().__init__()
 
@@ -149,13 +154,124 @@ class BiasAddLayerNormFP8(torch.nn.Module):
         bda_out = bias_dropout_add_fused(x, bias, residual, 0, True)
         bda_out = bda_out.view(-1, w_shape[-1])
 
-        ln_out = _LayerNormFP8.apply(bda_out, ln_weight, ln_bias, eps,
+        ln_out = _LayerNormFP8TE.apply(bda_out, ln_weight, ln_bias, eps,
                                      zero_centered_gamma, output_dtype, meta, do_bprop)
 
         return bda_out, ln_out, meta.amax_history[0][FP8_TENSOR_INDEX]
 
-bias_add_ln_te = BiasAddLayerNormFP8()
+bias_add_ln_te = BiasAddLayerNormFP8TE()
 
+# ------------------------------ nvFuser ------------------------------
+def partially_contig_tensor(
+    fd: "nvfuser.FusionDefinition",
+    x: torch.Tensor,
+) -> "nvfuser.Tensor":
+    return fd.define_tensor(
+        sizes=x.size(),
+        strides=x.stride(),
+        dtype=torch_dtype_to_nvfuser_dtype(x.dtype),
+    )
+
+class _BiasAddLayerNormFuser(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        bias: torch.Tensor,
+        residual: torch.Tensor,
+        w_shape: tuple,
+        ln_weight: torch.Tensor,
+        ln_bias: torch.Tensor,
+        eps: torch.float32,
+        output_dtype: torch.dtype,
+        zero_centered_gamma: bool,
+        meta: tex.FP8TensorMeta,
+    ):
+        # TODO: Add FP8 amax and scale
+        with nvfuser.FusionDefinition() as fd:
+            x_f = partially_contig_tensor(fd, x)
+            bias_f = partially_contig_tensor(fd, bias)
+            residual_f = partially_contig_tensor(fd, residual)
+            ln_weight_f = partially_contig_tensor(fd, ln_weight)
+            ln_bias_f = partially_contig_tensor(fd, ln_bias)
+
+            if zero_centered_gamma:
+                G0 = fd.define_scalar(1, dtype=nvfuser.DataType.Int)
+                ln_weight_f = fd.ops.add(ln_weight_f, G0)
+
+            # TODO: Promote LN weights to FP32?
+
+            # Bias-Add
+            T0 = fd.ops.add(x_f, bias_f)
+            T1 = fd.ops.add(T0, residual_f)
+
+            # LayerNorm
+            T2, T3 = fd.ops.var_mean(T1, [1], correction=0, keepdim=False)
+
+            V6 = fd.define_vector([T1.size(0), 1], dtype=nvfuser.DataType.Int)
+            T7 = fd.ops.broadcast_in_dim(T2, shape=V6, broadcast_dims=[0])
+            T11 = fd.ops.broadcast_in_dim(T3, shape=V6, broadcast_dims=[0])
+
+            S12 = fd.define_scalar(eps, dtype=nvfuser.DataType.Double)
+            T13 = fd.ops.add(T7, S12)
+            T14 = fd.ops.rsqrt(T13)
+
+            V17 = T1.shape()
+            T18 = fd.ops.broadcast_in_dim(T11, shape=V17, broadcast_dims=[0, 1])
+            T19 = fd.ops.sub(T1, T18)
+            T23 = fd.ops.broadcast_in_dim(T14, shape=V17, broadcast_dims=[0, 1])
+            T24 = fd.ops.mul(T19, T23)
+
+            T25 = fd.ops.broadcast_in_dim(ln_weight_f, shape=V17, broadcast_dims=[1])
+            T26 = fd.ops.mul(T24, T25)
+            T27 = fd.ops.broadcast_in_dim(ln_bias_f, shape=V17, broadcast_dims=[1])
+            T28 = fd.ops.add(T26, T27)
+
+            # TODO: Promote LN output?
+
+            fd.add_output(T1) # Bias-Add output
+            fd.add_output(T28) # LayerNorm output
+
+        bda_out, ln_out = fd.execute(x, bias, residual, ln_weight, ln_bias)
+
+        return bda_out, ln_out
+
+    @staticmethod
+    def backward(
+        ctx,
+        grad_output,
+    ):
+        # TODO
+        pass
+
+class BiasAddLayerNormFuser(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        bias: torch.Tensor,
+        residual: torch.Tensor,
+        w_shape: tuple,
+        ln_weight: torch.Tensor,
+        ln_bias: torch.Tensor,
+        eps: torch.float32,
+        output_dtype: torch.dtype,
+        zero_centered_gamma: bool,
+        meta: tex.FP8TensorMeta,
+        do_bprop: bool,
+    ):
+        bda_out, ln_out = _BiasAddLayerNormFuser.apply(x, bias, residual, w_shape,
+                                              ln_weight, ln_bias, eps,
+                                              output_dtype, zero_centered_gamma,
+                                              meta)
+
+        return bda_out, ln_out, meta.amax_history[0][FP8_TENSOR_INDEX]
+
+bias_add_ln_nvfuser = BiasAddLayerNormFuser()
+
+# ------------------------------ Common ------------------------------
 def bias_add_ln(*args, **kwargs) -> torch.Tensor:
     impl = kwargs["impl"]
     meta = kwargs["meta"]
@@ -167,6 +283,8 @@ def bias_add_ln(*args, **kwargs) -> torch.Tensor:
         result = bias_add_ln_compile(*args, meta.scale[FP8_TENSOR_INDEX], meta.amax_history[0][FP8_TENSOR_INDEX])
     elif impl == "te":
         result = bias_add_ln_te(*args, meta=meta, do_bprop=do_bprop)
+    elif impl == "nvfuser":
+        result = bias_add_ln_nvfuser(*args, meta.scale[FP8_TENSOR_INDEX], meta.amax_history[0][FP8_TENSOR_INDEX])
     else:
         raise ValueError(f"Implementation '{impl}' is not recognized.")
 
@@ -174,7 +292,7 @@ def bias_add_ln(*args, **kwargs) -> torch.Tensor:
 
 def main():
     # Implementations
-    all_impls = ["native", "compile", "te"]
+    all_impls = ["native", "compile", "te", "nvfuser"]
 
     # Settings - BF16 input/output
     input_dtype = torch.bfloat16
@@ -186,7 +304,7 @@ def main():
     zero_centered_gamma = True
     warmup_iters = 10
     main_iters = 1000
-    do_bprop = True
+    do_bprop = False
     compare = True
 
     # LayerNorm params
@@ -200,8 +318,8 @@ def main():
 
     fprop_result = {}
     bprop_result = {}
-    for impl in all_impls:
-    #for impl in ["te"]:
+    #for impl in all_impls:
+    for impl in ["nvfuser"]:
         ln_weight_impl = ln_weight.detach().clone().requires_grad_()
         ln_bias_impl = ln_bias.detach().clone().requires_grad_()
         x_impl = x.detach().clone().requires_grad_()
