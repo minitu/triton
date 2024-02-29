@@ -3,6 +3,7 @@ import transformer_engine.pytorch.cpp_extensions as tex
 
 FP8_TENSOR_INDEX = 0
 
+# ------------------------------ Native ------------------------------
 def bias_add_ln_fp8_native(
     x: torch.Tensor,
     bias: torch.Tensor,
@@ -34,10 +35,12 @@ def bias_add_ln_fp8_native(
 
     return out1, out2, amax_tensor
 
+# ------------------------------ Compile ------------------------------
 @torch.compile
 def bias_add_ln_fp8_compile(*args) -> torch.Tensor:
     return bias_add_ln_fp8_native(*args)
 
+# ------------------------------ TE ------------------------------
 @torch.compile
 def bias_dropout_add_fused(
     x: torch.Tensor,
@@ -67,20 +70,21 @@ class _LayerNormFP8(torch.autograd.Function):
         torch.cuda.nvtx.range_push("TE forward empty_like")
         ln_out = torch.empty_like(inp, dtype=torch.uint8)
         torch.cuda.nvtx.range_pop()
-        ln_out_kwarg = {"ln_out": ln_out}
+        output_kwarg = {"ln_out": ln_out}
         torch.cuda.nvtx.range_push("TE layernorm_fwd_fp8")
         ln_out, mu, rsigma = tex.layernorm_fwd_fp8(inp,
-                                             ln_weight,
-                                             ln_bias,
-                                             eps,
-                                             meta,
-                                             FP8_TENSOR_INDEX, # tex.FP8FwdTensors.GEMM1_INPUT
-                                             tex.DType.kFloat8E4M3, # fp8_dtype_forward
-                                             0, # TODO: fwd_ln_sm_margin
-                                             zero_centered_gamma,
-                                             **ln_out_kwarg,
+                                                   ln_weight,
+                                                   ln_bias,
+                                                   eps,
+                                                   meta,
+                                                   FP8_TENSOR_INDEX, # tex.FP8FwdTensors.GEMM1_INPUT
+                                                   tex.DType.kFloat8E4M3, # fp8_dtype_forward
+                                                   0, # TODO: fwd_ln_sm_margin
+                                                   zero_centered_gamma,
+                                                   **output_kwarg,
         )
         torch.cuda.nvtx.range_pop()
+
         if do_bprop:
             # Cast LN output to BF16 for bprop, need to remove from perf cost
             #ln_out = ln_out.to(torch.bfloat16)
@@ -160,6 +164,135 @@ class BiasAddLayerNormFP8(torch.nn.Module):
 
 bias_add_ln_fp8_te = BiasAddLayerNormFP8()
 
+# ------------------------------ TE Fused ------------------------------
+@torch.compile
+def bias_dropout_add_fused(
+    x: torch.Tensor,
+    bias: torch.Tensor,
+    residual: torch.Tensor,
+    prob: float,
+    training: bool,
+) -> torch.Tensor:
+    """dropout(inp + bias) + residual"""
+    out = torch.nn.functional.dropout(x + bias, p=prob, training=training)
+    out = residual + out
+    return out
+
+class _BiasAddLayerNormFP8(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        inp: torch.Tensor,
+        bda_bias: torch.Tensor,
+        bda_residual: torch.Tensor,
+        ln_weight: torch.Tensor,
+        ln_bias: torch.Tensor,
+        eps: torch.float32,
+        zero_centered_gamma: bool,
+        output_dtype: torch.dtype,
+        meta: tex.FP8TensorMeta,
+        do_bprop: bool
+    ):
+        torch.cuda.nvtx.range_push("TE forward empty_like")
+        bda_out = torch.empty_like(inp, dtype=inp.dtype)
+        ln_out = torch.empty_like(inp, dtype=torch.uint8)
+        torch.cuda.nvtx.range_pop()
+        output_kwarg = {"bda_out": bda_out, "ln_out": ln_out}
+        torch.cuda.nvtx.range_push("TE bias_add_layernorm_fwd_fp8")
+        bda_out, ln_out, mu, rsigma = tex.bias_add_layernorm_fwd_fp8(inp,
+                                                                     bda_bias,
+                                                                     bda_residual,
+                                                                     ln_weight,
+                                                                     ln_bias,
+                                                                     eps,
+                                                                     meta,
+                                                                     FP8_TENSOR_INDEX, # tex.FP8FwdTensors.GEMM1_INPUT
+                                                                     tex.DType.kFloat8E4M3, # fp8_dtype_forward
+                                                                     0, # TODO: fwd_ln_sm_margin
+                                                                     zero_centered_gamma,
+                                                                     **output_kwarg,
+        )
+        torch.cuda.nvtx.range_pop()
+
+        # TODO
+        if do_bprop:
+            # Cast LN output to BF16 for bprop, need to remove from perf cost
+            #ln_out = ln_out.to(torch.bfloat16)
+            torch.cuda.nvtx.range_push("TE forward view, requires_grad")
+            ln_out = ln_out.view(output_dtype)
+            ln_out.requires_grad_()
+            torch.cuda.nvtx.range_pop()
+
+            torch.cuda.nvtx.range_push("TE forward save")
+            ctx.save_for_backward(
+                inp,
+                ln_weight,
+                mu,
+                rsigma
+            )
+            ctx.zero_centered_gamma = zero_centered_gamma
+            torch.cuda.nvtx.range_pop()
+
+        return bda_out, ln_out
+
+    # TODO
+    @staticmethod
+    def backward(
+        ctx,
+        grad_output,
+    ):
+        (inp, ln_weight, mu, rsigma) = ctx.saved_tensors
+
+        # Incoming grad cast to BF16, need to remove from perf cost
+        torch.cuda.nvtx.range_push("TE backward cast")
+        grad_output_bf16 = grad_output.to(torch.bfloat16)
+        torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_push("TE layernorm_bwd")
+        dgrad, dgamma, dbeta = tex.layernorm_bwd(
+            grad_output_bf16, inp, mu, rsigma, ln_weight, 0, ctx.zero_centered_gamma
+        )
+        torch.cuda.nvtx.range_pop()
+
+        return (
+            dgrad,
+            dgamma,
+            dbeta,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+class BiasAddLayerNormFP8Fused(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        bias: torch.Tensor,
+        residual: torch.Tensor,
+        w_shape: tuple,
+        ln_weight: torch.Tensor,
+        ln_bias: torch.Tensor,
+        eps: torch.float32,
+        fp8_scale: torch.float32,
+        output_dtype: torch.dtype,
+        zero_centered_gamma: bool,
+        meta: tex.FP8TensorMeta,
+        do_bprop: bool,
+    ):
+        # TODO: Remove views?
+        bda_out, ln_out = _BiasAddLayerNormFP8.apply(x.view(-1, w_shape[-1]), bias, residual.view(-1, w_shape[-1]),
+                                                     ln_weight, ln_bias, eps,
+                                                     zero_centered_gamma, output_dtype, meta, do_bprop)
+        ln_out_ret = ln_out.view(output_dtype)
+
+        return bda_out, ln_out_ret, meta.amax_history[0][FP8_TENSOR_INDEX]
+
+bias_add_ln_fp8_te_fused = BiasAddLayerNormFP8Fused()
+
 def bias_add_ln_fp8(*args, **kwargs) -> torch.Tensor:
     impl = kwargs["impl"]
     meta = kwargs["meta"]
@@ -171,6 +304,8 @@ def bias_add_ln_fp8(*args, **kwargs) -> torch.Tensor:
         result = bias_add_ln_fp8_compile(*args, meta.scale[FP8_TENSOR_INDEX], meta.amax_history[0][FP8_TENSOR_INDEX])
     elif impl == "te":
         result = bias_add_ln_fp8_te(*args, meta=meta, do_bprop=do_bprop)
+    elif impl == "te_fused":
+        result = bias_add_ln_fp8_te_fused(*args, meta=meta, do_bprop=do_bprop)
     else:
         raise ValueError(f"Implementation '{impl}' is not recognized.")
 
@@ -178,7 +313,7 @@ def bias_add_ln_fp8(*args, **kwargs) -> torch.Tensor:
 
 def main():
     # Implementations
-    all_impls = ["native", "compile", "te"]
+    all_impls = ["native", "compile", "te", "te_fused"]
 
     # Settings - BF16 input, FP8 output
     input_dtype = torch.bfloat16
@@ -190,7 +325,7 @@ def main():
     zero_centered_gamma = True
     warmup_iters = 10
     main_iters = 100
-    do_bprop = True
+    do_bprop = False
     compare = True
 
     # LayerNorm params
@@ -205,7 +340,7 @@ def main():
     fprop_result = {}
     bprop_result = {}
     for impl in all_impls:
-    #for impl in ["te"]:
+    #for impl in ["te_fused"]:
         ln_weight_impl = ln_weight.detach().clone().requires_grad_()
         ln_bias_impl = ln_bias.detach().clone().requires_grad_()
         x_impl = x.detach().clone().requires_grad_()
