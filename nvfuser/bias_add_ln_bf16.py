@@ -185,24 +185,27 @@ class _BiasAddLayerNormFuser(torch.autograd.Function):
         eps: torch.float32,
         output_dtype: torch.dtype,
         zero_centered_gamma: bool,
-        meta: tex.FP8TensorMeta,
+        scale_tensor: torch.Tensor,
+        amax_tensor: torch.Tensor,
     ):
-        # TODO: Add FP8 amax and scale
         with nvfuser.FusionDefinition() as fd:
             x_f = partially_contig_tensor(fd, x)
             bias_f = partially_contig_tensor(fd, bias)
             residual_f = partially_contig_tensor(fd, residual)
             ln_weight_f = partially_contig_tensor(fd, ln_weight)
             ln_bias_f = partially_contig_tensor(fd, ln_bias)
+            scale_f = partially_contig_tensor(fd, scale_tensor)
+            amax_f = partially_contig_tensor(fd, amax_tensor)
 
+            # Add 1 to LayerNorm weights if needed
             if zero_centered_gamma:
                 G0 = fd.define_scalar(1, dtype=nvfuser.DataType.Int)
                 ln_weight_f = fd.ops.add(ln_weight_f, G0)
 
-            # TODO: Promote LN weights to FP32?
-
             # Bias-Add
-            T0 = fd.ops.add(x_f, bias_f)
+            V17 = x_f.shape()
+            B0 = fd.ops.broadcast_in_dim(bias_f, shape=V17, broadcast_dims=[1])
+            T0 = fd.ops.add(x_f, B0)
             T1 = fd.ops.add(T0, residual_f)
 
             # LayerNorm
@@ -216,7 +219,6 @@ class _BiasAddLayerNormFuser(torch.autograd.Function):
             T13 = fd.ops.add(T7, S12)
             T14 = fd.ops.rsqrt(T13)
 
-            V17 = T1.shape()
             T18 = fd.ops.broadcast_in_dim(T11, shape=V17, broadcast_dims=[0, 1])
             T19 = fd.ops.sub(T1, T18)
             T23 = fd.ops.broadcast_in_dim(T14, shape=V17, broadcast_dims=[0, 1])
@@ -227,14 +229,23 @@ class _BiasAddLayerNormFuser(torch.autograd.Function):
             T27 = fd.ops.broadcast_in_dim(ln_bias_f, shape=V17, broadcast_dims=[1])
             T28 = fd.ops.add(T26, T27)
 
-            # TODO: Promote LN output?
+            # Amax
+            T29 = fd.ops.abs(T28)
+            T30 = fd.ops.max(T29)
 
+            # Scale
+            T31 = fd.ops.mul(T28, scale_f)
+
+            # TODO: Cast LayerNorm output to FP8 (should be FP32 at this point)
             fd.add_output(T1) # Bias-Add output
-            fd.add_output(T28) # LayerNorm output
+            fd.add_output(T31) # LayerNorm output
+            fd.add_output(T30) # TODO: Amax output, fill input tensor instead?
 
-        bda_out, ln_out = fd.execute(x, bias, residual, ln_weight, ln_bias)
+        bda_out, ln_out, amax_tensor = fd.execute([x, bias, residual,
+                                                   ln_weight, ln_bias,
+                                                   scale_tensor, amax_tensor])
 
-        return bda_out, ln_out
+        return bda_out, ln_out, amax_tensor
 
     @staticmethod
     def backward(
@@ -259,15 +270,18 @@ class BiasAddLayerNormFuser(torch.nn.Module):
         eps: torch.float32,
         output_dtype: torch.dtype,
         zero_centered_gamma: bool,
-        meta: tex.FP8TensorMeta,
+        scale_tensor: torch.Tensor,
+        amax_tensor: torch.Tensor,
         do_bprop: bool,
     ):
-        bda_out, ln_out = _BiasAddLayerNormFuser.apply(x, bias, residual, w_shape,
+        x = x.view(-1, w_shape[-1])
+        residual = residual.view(-1, w_shape[-1])
+        bda_out, ln_out, amax_tensor = _BiasAddLayerNormFuser.apply(x, bias, residual, w_shape,
                                               ln_weight, ln_bias, eps,
                                               output_dtype, zero_centered_gamma,
-                                              meta)
+                                              scale_tensor, amax_tensor)
 
-        return bda_out, ln_out, meta.amax_history[0][FP8_TENSOR_INDEX]
+        return bda_out, ln_out, amax_tensor
 
 bias_add_ln_nvfuser = BiasAddLayerNormFuser()
 
@@ -284,7 +298,7 @@ def bias_add_ln(*args, **kwargs) -> torch.Tensor:
     elif impl == "te":
         result = bias_add_ln_te(*args, meta=meta, do_bprop=do_bprop)
     elif impl == "nvfuser":
-        result = bias_add_ln_nvfuser(*args, meta.scale[FP8_TENSOR_INDEX], meta.amax_history[0][FP8_TENSOR_INDEX])
+        result = bias_add_ln_nvfuser(*args, meta.scale[FP8_TENSOR_INDEX], meta.amax_history[0][FP8_TENSOR_INDEX], do_bprop=do_bprop)
     else:
         raise ValueError(f"Implementation '{impl}' is not recognized.")
 
