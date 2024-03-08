@@ -76,16 +76,16 @@ class _BiasAddLayerNormFuser(torch.autograd.Function):
             # Scale
             T31 = fd.ops.mul(T28, scale_f)
 
-            # TODO: Cast LayerNorm output to FP8 (should be FP32 at this point)
             fd.add_output(T1) # Bias-Add output
-            fd.add_output(T31) # LayerNorm output
-            fd.add_output(T30) # Amax output, TODO: fill input tensor instead?
+            T32 = fd.ops.cast(T31, dtype=torch_dtype_to_nvfuser_dtype(output_dtype))
+            fd.add_output(T32) # LayerNorm output
+            fd.add_output(T30, alias_input=amax_f) # Amax output, TODO: fill input tensor instead?
 
-        bda_out, ln_out, amax_tensor = fd.execute([x, bias, residual,
+        bda_out, ln_out = fd.execute([x, bias, residual,
                                                    ln_weight, ln_bias,
                                                    scale_tensor, amax_tensor])
 
-        return bda_out, ln_out, amax_tensor
+        return bda_out, ln_out
 
     @staticmethod
     def backward(
@@ -113,12 +113,12 @@ class BiasAddLayerNormFuser(torch.nn.Module):
         scale_tensor: torch.Tensor,
         amax_tensor: torch.Tensor,
     ):
-        bda_out, ln_out, amax_tensor = _BiasAddLayerNormFuser.apply(x, bias, residual, w_shape,
+        bda_out, ln_out = _BiasAddLayerNormFuser.apply(x, bias, residual, w_shape,
                                               ln_weight, ln_bias, eps,
                                               output_dtype, zero_centered_gamma,
                                               scale_tensor, amax_tensor)
 
-        return bda_out, ln_out, amax_tensor
+        return bda_out, ln_out
 
 
 def main():
@@ -145,10 +145,12 @@ def main():
 
     # Create 'model' and do fprop
     bias_add_ln_nvfuser = BiasAddLayerNormFuser()
-    bda_out, ln_out, amax_tensor = bias_add_ln_nvfuser(x, bias, residual, w_shape,
+    print("amax before: ", fp8_amax_history)
+    bda_out, ln_out = bias_add_ln_nvfuser(x, bias, residual, w_shape,
                                                        ln_weight, ln_bias, eps,
                                                        output_dtype, zero_centered_gamma,
                                                        fp8_scale[0], fp8_amax_history[0][0])
+    print("amax after: ", fp8_amax_history)
 
 if __name__ == '__main__':
     main()
