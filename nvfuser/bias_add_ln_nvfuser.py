@@ -158,6 +158,17 @@ def main():
                                                        output_dtype, zero_centered_gamma,
                                                        fp8_scale[0], fp8_amax_history[0][0])
     print("amax after: ", fp8_amax_history)
+    torch.cuda.synchronize()
+
+    import time
+    t0 = time.time()
+    for i in range(100):
+        bda_out, ln_out = bias_add_ln_nvfuser(x, bias, residual, w_shape,
+                                                           ln_weight, ln_bias, eps,
+                                                           output_dtype, zero_centered_gamma,
+                                                           fp8_scale[0], fp8_amax_history[0][0])
+    torch.cuda.synchronize()
+    print("elapsed time: ", time.time() - t0)
 
 if __name__ == '__main__':
     main()
