@@ -47,8 +47,9 @@ class _BiasAddLayerNormFuser(torch.autograd.Function):
             B0 = fd.ops.broadcast_in_dim(bias_f, shape=V17, broadcast_dims=[1])
             T0 = fd.ops.add(x_f, B0)
             T1 = fd.ops.add(T0, residual_f)
-            #T1_half = fd.ops.cast(T1, nvfuser.DataType.BFloat16)
-            #fd.add_output(T1_half) # Bias-Add output
+            # Bias-Add can output as bfloat16
+            T1_half = fd.ops.cast(T1, nvfuser.DataType.BFloat16)
+            fd.add_output(T1_half) # Bias-Add output
 
             # LayerNorm
             T2, T3 = fd.ops.var_mean(T1, [1], correction=0, keepdim=False)
@@ -72,18 +73,20 @@ class _BiasAddLayerNormFuser(torch.autograd.Function):
             T28 = fd.ops.add(T26, T27)
 
             # Amax
+            # first half of amax is done along with the layer_norm kernel
             T29 = fd.ops.abs(T28)
             T29_sum = fd.ops.max(T29, [1])
             T29_sum_fp8 = fd.ops.cast(T29_sum, dtype=torch_dtype_to_nvfuser_dtype(output_dtype))
+            # manaul segmentation
             T_seg_2 = fd.ops.segment_set(T29_sum_fp8)
 
+            # second half of amax is done in a standalone kernel
             T29_sum_fp32 = fd.ops.cast(T_seg_2, dtype=torch_dtype_to_nvfuser_dtype(torch.float32))
             T30 = fd.ops.max(T29_sum_fp32 )
 
             # Scale
             T31 = fd.ops.mul(T28, scale_f)
 
-            fd.add_output(T1) # Bias-Add output
             T32 = fd.ops.cast(T31, dtype=torch_dtype_to_nvfuser_dtype(output_dtype))
             fd.add_output(T32) # LayerNorm output
             fd.add_output(T30, alias_input=amax_f) # Amax output, TODO: fill input tensor instead?
@@ -152,23 +155,18 @@ def main():
 
     # Create 'model' and do fprop
     bias_add_ln_nvfuser = BiasAddLayerNormFuser()
-    print("amax before: ", fp8_amax_history)
+    torch.cuda.synchronize()
     bda_out, ln_out = bias_add_ln_nvfuser(x, bias, residual, w_shape,
                                                        ln_weight, ln_bias, eps,
                                                        output_dtype, zero_centered_gamma,
                                                        fp8_scale[0], fp8_amax_history[0][0])
-    print("amax after: ", fp8_amax_history)
     torch.cuda.synchronize()
-
-    import time
-    t0 = time.time()
     for i in range(100):
         bda_out, ln_out = bias_add_ln_nvfuser(x, bias, residual, w_shape,
                                                            ln_weight, ln_bias, eps,
                                                            output_dtype, zero_centered_gamma,
                                                            fp8_scale[0], fp8_amax_history[0][0])
     torch.cuda.synchronize()
-    print("elapsed time: ", time.time() - t0)
 
 if __name__ == '__main__':
     main()
