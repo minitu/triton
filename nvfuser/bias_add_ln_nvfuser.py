@@ -89,7 +89,7 @@ class _BiasAddLayerNormFuser(torch.autograd.Function):
 
             T32 = fd.ops.cast(T31, dtype=torch_dtype_to_nvfuser_dtype(output_dtype))
             fd.add_output(T32) # LayerNorm output
-            fd.add_output(T30, alias_input=amax_f) # Amax output, TODO: fill input tensor instead?
+            fd.add_output(T30, alias_input=amax_f) # Amax output inplace update
 
         bda_out, ln_out = fd.execute([x, bias, residual,
                                                    ln_weight, ln_bias,
