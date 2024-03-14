@@ -47,6 +47,8 @@ class _BiasAddLayerNormFuser(torch.autograd.Function):
             B0 = fd.ops.broadcast_in_dim(bias_f, shape=V17, broadcast_dims=[1])
             T0 = fd.ops.add(x_f, B0)
             T1 = fd.ops.add(T0, residual_f)
+            #T1_half = fd.ops.cast(T1, nvfuser.DataType.BFloat16)
+            #fd.add_output(T1_half) # Bias-Add output
 
             # LayerNorm
             T2, T3 = fd.ops.var_mean(T1, [1], correction=0, keepdim=False)
@@ -71,7 +73,12 @@ class _BiasAddLayerNormFuser(torch.autograd.Function):
 
             # Amax
             T29 = fd.ops.abs(T28)
-            T30 = fd.ops.max(T29)
+            T29_sum = fd.ops.max(T29, [1])
+            T29_sum_fp8 = fd.ops.cast(T29_sum, dtype=torch_dtype_to_nvfuser_dtype(output_dtype))
+            T_seg_2 = fd.ops.segment_set(T29_sum_fp8)
+
+            T29_sum_fp32 = fd.ops.cast(T_seg_2, dtype=torch_dtype_to_nvfuser_dtype(torch.float32))
+            T30 = fd.ops.max(T29_sum_fp32 )
 
             # Scale
             T31 = fd.ops.mul(T28, scale_f)
