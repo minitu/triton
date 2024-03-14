@@ -76,7 +76,7 @@ class _BiasAddLayerNormFuser(torch.autograd.Function):
             # first half of amax is done along with the layer_norm kernel
             T29 = fd.ops.abs(T28)
             T29_sum = fd.ops.max(T29, [1])
-            T29_sum_fp8 = fd.ops.cast(T29_sum, dtype=torch_dtype_to_nvfuser_dtype(output_dtype))
+            T29_sum_fp8 = fd.ops.cast(T29_sum, dtype=nvfuser.DataType.BFloat16)
             # manaul segmentation
             T_seg_2 = fd.ops.segment_set(T29_sum_fp8)
 
